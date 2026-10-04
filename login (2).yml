@@ -1,0 +1,101 @@
+# .github/workflows/login.yml
+#
+# Required secrets (Settings -> Secrets and variables -> Actions):
+#   PHONE_NUMBER     Your 10-digit mobile number registered on AlgoTest
+#   AT_PASSWORD      Your AlgoTest account password
+#   TOTP_SECRET      Your Upstox TOTP secret key   (Upstox users only)
+#   PIN              Your Upstox 6-digit PIN        (Upstox users only)
+#   U                Your Flattrade User ID          (Flattrade users only)
+#   P                Your Flattrade password         (Flattrade users only)
+#   T                Your Flattrade TOTP secret key  (Flattrade users only)
+
+name: AlgoTest Daily Login
+
+on:
+  repository_dispatch:
+    types: [trigger-login]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  login:
+    name: AlgoTest + Broker Login
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Login (3 attempts, 30s apart)
+        env:
+          PHONE_NUMBER: ${{ secrets.PHONE_NUMBER }}
+          AT_PASSWORD:  ${{ secrets.AT_PASSWORD }}
+          TOTP_SECRET:  ${{ secrets.TOTP_SECRET }}
+          PIN:          ${{ secrets.PIN }}
+          U:            ${{ secrets.U }}
+          P:            ${{ secrets.P }}
+          T:            ${{ secrets.T }}
+        run: |
+          # Guard: fail immediately if required secrets are missing
+          MISSING=""
+          [ -z "$PHONE_NUMBER" ] && MISSING="$MISSING PHONE_NUMBER"
+          [ -z "$AT_PASSWORD" ]  && MISSING="$MISSING AT_PASSWORD"
+          if [ -n "$MISSING" ]; then
+            echo "ERROR: Missing required secret(s): $MISSING"
+            echo "Add them in Settings -> Secrets and variables -> Actions"
+            exit 1
+          fi
+
+          # Server URL is managed by admin — users do not need to configure this
+          SERVER_URL="https://algotest-api.onrender.com"
+
+          MAX_ATTEMPTS=3
+          DELAY=30
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo ""
+            echo "========================================"
+            echo "  Attempt $attempt of $MAX_ATTEMPTS"
+            echo "========================================"
+
+            echo "Fetching OIDC token..."
+            OIDC_TOKEN=$(curl --silent --fail \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=render-api-audience" \
+              | jq -r '.value')
+
+            if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+              echo "ERROR: Failed to obtain OIDC token."
+              exit 1
+            fi
+            echo "OIDC token obtained."
+
+            RESPONSE=$(curl --silent \
+              --max-time 300 \
+              -w "\n%{http_code}" \
+              -X POST "${SERVER_URL}/login" \
+              -H "Authorization: Bearer $OIDC_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"phone_number\":\"${PHONE_NUMBER}\",\"password\":\"${AT_PASSWORD}\",\"totp_secret\":\"${TOTP_SECRET}\",\"pin\":\"${PIN}\",\"broker\":\"algotest\",\"u\":\"${U}\",\"p\":\"${P}\",\"t\":\"${T}\"}")
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | head -n -1)
+
+            echo "HTTP status : $HTTP_CODE"
+            echo "Response    : $BODY"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Login successful on attempt $attempt."
+              exit 0
+            fi
+
+            echo "Attempt $attempt failed (HTTP $HTTP_CODE)."
+            if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+              echo "Waiting ${DELAY}s before retry..."
+              sleep $DELAY
+            fi
+          done
+
+          echo "All $MAX_ATTEMPTS attempts failed. Check Telegram for screenshot."
+          exit 1
